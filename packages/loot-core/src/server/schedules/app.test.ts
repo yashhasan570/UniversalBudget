@@ -1,0 +1,1768 @@
+// @ts-strict-ignore
+import MockDate from 'mockdate';
+
+import { aqlQuery } from '#server/aql';
+import * as db from '#server/db';
+import { loadMappings } from '#server/db/mappings';
+import { app as mainApp } from '#server/main-app';
+import { runMutator } from '#server/mutators';
+import * as prefs from '#server/prefs';
+import {
+  loadRules,
+  runRules,
+  updateRule,
+} from '#server/transactions/transaction-rules';
+import { q } from '#shared/query';
+import { getNextDate } from '#shared/schedules';
+import type { ServerEvents } from '#types/server-events';
+
+import {
+  advanceSchedulesService,
+  areConditionValuesEqual,
+  createSchedule,
+  deleteSchedule,
+  app as schedulesApp,
+  setNextDate,
+  skipNextDate,
+  updateConditions,
+  updateSchedule,
+} from './app';
+
+beforeEach(async () => {
+  await global.emptyDatabase()();
+  await loadMappings();
+  await loadRules();
+});
+
+describe('schedule app', () => {
+  describe('utility', () => {
+    it('conditions are updated when they exist', () => {
+      const conds = [
+        { op: 'is', field: 'payee', value: 'FOO' },
+        { op: 'is', field: 'date', value: '2020-01-01' },
+      ];
+
+      const updated = updateConditions(conds, [
+        {
+          op: 'is',
+          field: 'payee',
+          value: 'bar',
+        },
+      ]);
+
+      expect(updated.length).toBe(2);
+      expect(updated[0].value).toBe('bar');
+    });
+
+    it("conditions are added if they don't exist", () => {
+      const conds = [
+        { op: 'contains', field: 'payee', value: 'FOO' },
+        { op: 'contains', field: 'notes', value: 'dflksjdflskdjf' },
+      ];
+
+      const updated = updateConditions(conds, [
+        {
+          op: 'is',
+          field: 'payee',
+          value: 'bar',
+        },
+      ]);
+
+      expect(updated.length).toBe(3);
+    });
+
+    it('getNextDate works with date conditions', () => {
+      expect(
+        getNextDate({ op: 'is', field: 'date', value: '2021-04-30' }),
+      ).toBe('2021-04-30');
+
+      expect(
+        getNextDate({
+          op: 'is',
+          field: 'date',
+          value: {
+            start: '2020-12-20',
+            frequency: 'monthly',
+            patterns: [
+              { type: 'day', value: 15 },
+              { type: 'day', value: 30 },
+            ],
+          },
+        }),
+      ).toBe('2020-12-30');
+    });
+
+    it('areConditionValuesEqual matches nested objects regardless of key order', () => {
+      expect(
+        areConditionValuesEqual(
+          {
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 15 },
+                { type: 'day', value: 30 },
+              ],
+            },
+            field: 'date',
+          },
+          {
+            field: 'date',
+            value: {
+              patterns: [
+                { value: 15, type: 'day' },
+                { value: 30, type: 'day' },
+              ],
+              frequency: 'monthly',
+              start: '2020-12-20',
+            },
+          },
+        ),
+      ).toBe(true);
+    });
+
+    it('areConditionValuesEqual returns false for different array ordering', () => {
+      expect(
+        areConditionValuesEqual(
+          [{ field: 'date' }, { field: 'account' }],
+          [{ field: 'account' }, { field: 'date' }],
+        ),
+      ).toBe(false);
+    });
+
+    it('areConditionValuesEqual distinguishes nullish values', () => {
+      expect(areConditionValuesEqual(null, undefined)).toBe(false);
+      expect(areConditionValuesEqual(undefined, undefined)).toBe(true);
+    });
+  });
+
+  describe('methods', () => {
+    it('createSchedule creates a schedule', async () => {
+      const id = await createSchedule({
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 15 },
+                { type: 'day', value: 30 },
+              ],
+            },
+          },
+        ],
+      });
+
+      const {
+        data: [row],
+      } = await aqlQuery(q('schedules').filter({ id }).select('*'));
+
+      expect(row).toBeTruthy();
+      expect(row.rule).toBeTruthy();
+      expect(row.next_date).toBe('2020-12-30');
+
+      await expect(
+        createSchedule({
+          conditions: [{ op: 'is', field: 'payee', value: 'p1' }],
+        }),
+      ).rejects.toThrow(/date condition is required/);
+    });
+
+    it('identifies schedules with split actions', async () => {
+      const id = await createSchedule({
+        conditions: [{ op: 'is', field: 'date', value: '2020-12-20' }],
+      });
+      const { data: ruleId } = await aqlQuery(
+        q('schedules').filter({ id }).calculate('rule'),
+      );
+
+      await updateRule({
+        id: ruleId,
+        actions: [
+          {
+            op: 'set',
+            field: 'payee',
+            value: 'destination-payee',
+            options: { splitIndex: 0 },
+          },
+          { op: 'link-schedule', value: id },
+        ],
+      });
+
+      const { data: parentActionMatches } = await aqlQuery(
+        q('schedules').filter({ _has_splits: true }).select(['id']),
+      );
+      expect(parentActionMatches).toEqual([]);
+
+      await updateRule({
+        id: ruleId,
+        actions: [
+          {
+            op: 'set',
+            field: 'payee',
+            value: 'destination-payee',
+            options: { splitIndex: 1 },
+          },
+          { op: 'link-schedule', value: id },
+        ],
+      });
+
+      const { data: splitActionMatches } = await aqlQuery(
+        q('schedules').filter({ _has_splits: true }).select(['id']),
+      );
+
+      expect(splitActionMatches).toEqual([{ id }]);
+    });
+
+    it('trims schedule names when creating and updating schedules', async () => {
+      const id = await createSchedule({
+        schedule: { name: '  Rent  ' },
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: '2020-12-20',
+          },
+        ],
+      });
+
+      let res = await aqlQuery(q('schedules').filter({ id }).select(['name']));
+      expect(res.data[0].name).toBe('Rent');
+
+      await updateSchedule({
+        schedule: { id, name: '  Mortgage  ' },
+      });
+
+      res = await aqlQuery(q('schedules').filter({ id }).select(['name']));
+      expect(res.data[0].name).toBe('Mortgage');
+    });
+
+    it('treats names as duplicates after trimming whitespace', async () => {
+      await createSchedule({
+        schedule: { name: 'Rent' },
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: '2020-12-20',
+          },
+        ],
+      });
+
+      await expect(
+        createSchedule({
+          schedule: { name: '  Rent  ' },
+          conditions: [
+            {
+              op: 'is',
+              field: 'date',
+              value: '2020-12-20',
+            },
+          ],
+        }),
+      ).rejects.toThrow(/same name/);
+    });
+
+    it('updateSchedule updates a schedule', async () => {
+      const id = await createSchedule({
+        conditions: [
+          { op: 'is', field: 'payee', value: 'foo' },
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 15 },
+                { type: 'day', value: 30 },
+              ],
+            },
+          },
+        ],
+      });
+
+      let res = await aqlQuery(
+        q('schedules')
+          .filter({ id })
+          .select(['next_date', 'posts_transaction']),
+      );
+      let row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-30');
+      expect(row.posts_transaction).toBe(false);
+
+      MockDate.set(new Date(2021, 4, 17));
+
+      await updateSchedule({
+        schedule: { id, posts_transaction: true },
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 18 },
+                { type: 'day', value: 29 },
+              ],
+            },
+          },
+        ],
+      });
+
+      res = await aqlQuery(
+        q('schedules')
+          .filter({ id })
+          .select(['next_date', 'posts_transaction']),
+      );
+      row = res.data[0];
+
+      // Updating the date condition updates `next_date`
+      expect(row.next_date).toBe('2021-05-18');
+      expect(row.posts_transaction).toBe(true);
+    });
+
+    it('updateSchedule does not update `next_date` when unrelated conditions change', async () => {
+      const id = await createSchedule({
+        conditions: [
+          { op: 'is', field: 'payee', value: 'foo' },
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 15 },
+                { type: 'day', value: 30 },
+              ],
+            },
+          },
+        ],
+      });
+
+      MockDate.set(new Date(2021, 4, 17));
+
+      await updateSchedule({
+        schedule: { id },
+        conditions: [{ op: 'is', field: 'payee', value: 'bar' }],
+      });
+
+      const {
+        data: [row],
+      } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+      expect(row.next_date).toBe('2020-12-30');
+    });
+
+    it('preserves skipped dates on rename but resets them when the account changes', async () => {
+      MockDate.set(new Date(2021, 4, 17));
+
+      const accountId = await db.insertAccount({ name: 'Checking' });
+      const otherAccountId = await db.insertAccount({ name: 'Savings' });
+      const id = await createSchedule({
+        conditions: [
+          { op: 'is', field: 'account', value: accountId },
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2021-05-17',
+              frequency: 'monthly',
+              patterns: [{ type: 'day', value: 17 }],
+            },
+          },
+        ],
+      });
+
+      await skipNextDate({ id });
+      const {
+        data: [schedule],
+      } = await aqlQuery(q('schedules').filter({ id }).select(['_conditions']));
+      // Advance the clock so a reset stamps a newer `base_next_date_ts` than the skip
+      MockDate.set(new Date(2021, 4, 17, 0, 1));
+
+      await updateSchedule({
+        schedule: { id, name: 'Broadband' },
+        conditions: schedule._conditions,
+      });
+      let result = await aqlQuery(
+        q('schedules').filter({ id }).calculate('next_date'),
+      );
+      expect(result.data).toBe('2021-06-17');
+
+      await updateSchedule({
+        schedule: { id },
+        conditions: schedule._conditions.map(condition =>
+          condition.value === accountId
+            ? { ...condition, value: otherAccountId }
+            : condition,
+        ),
+      });
+      result = await aqlQuery(
+        q('schedules').filter({ id }).calculate('next_date'),
+      );
+      expect(result.data).toBe('2021-05-17');
+    });
+
+    it('updateSchedule ignores the condition `type` field when date value is unchanged', async () => {
+      const id = await createSchedule({
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 15 },
+                { type: 'day', value: 30 },
+              ],
+            },
+          },
+        ],
+      });
+
+      MockDate.set(new Date(2021, 4, 17));
+
+      await updateSchedule({
+        schedule: { id },
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            type: 'date',
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 15 },
+                { type: 'day', value: 30 },
+              ],
+            },
+          },
+        ],
+      });
+
+      const {
+        data: [row],
+      } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+      expect(row.next_date).toBe('2020-12-30');
+    });
+
+    it('deleteSchedule deletes a schedule', async () => {
+      const id = await createSchedule({
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 15 },
+                { type: 'day', value: 30 },
+              ],
+            },
+          },
+        ],
+      });
+
+      const { data: schedules } = await aqlQuery(q('schedules').select('*'));
+      expect(schedules.length).toBe(1);
+
+      await deleteSchedule({ id });
+      const { data: schedules2 } = await aqlQuery(q('schedules').select('*'));
+      expect(schedules2.length).toBe(0);
+    });
+
+    describe('completed schedules and rules', () => {
+      async function createMatchingSchedule() {
+        const accountId = await db.insertAccount({
+          name: 'Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+        const id = await createSchedule({
+          schedule: { name: 'Rent' },
+          conditions: [
+            { op: 'is', field: 'account', value: accountId },
+            { op: 'is', field: 'amount', value: -10000 },
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2016-12-01',
+                frequency: 'monthly',
+                patterns: [],
+                skipWeekend: false,
+                weekendSolveMode: 'after',
+                endMode: 'never',
+                endOccurrences: 1,
+                endDate: '2016-12-31',
+              },
+            },
+          ],
+        });
+        const transaction = {
+          account: accountId,
+          amount: -10000,
+          date: '2017-01-01',
+        };
+        return { id, transaction };
+      }
+
+      it('links a new transaction to an active schedule', async () => {
+        const { id, transaction } = await createMatchingSchedule();
+
+        const result = await runRules(transaction);
+
+        expect(result.schedule).toBe(id);
+      });
+
+      it('does not link a new transaction to a completed schedule', async () => {
+        const { id, transaction } = await createMatchingSchedule();
+
+        await updateSchedule({ schedule: { id, completed: true } });
+
+        const result = await runRules(transaction);
+
+        expect(result.schedule).toBeFalsy();
+      });
+
+      it('links again after a completed schedule is reopened', async () => {
+        const { id, transaction } = await createMatchingSchedule();
+
+        await updateSchedule({ schedule: { id, completed: true } });
+        await updateSchedule({ schedule: { id, completed: false } });
+
+        const result = await runRules(transaction);
+
+        expect(result.schedule).toBe(id);
+      });
+
+      it('still runs the rule of a completed schedule for a transaction already linked to it', async () => {
+        const { id, transaction } = await createMatchingSchedule();
+        const { data: ruleId } = await aqlQuery(
+          q('schedules').filter({ id }).calculate('rule'),
+        );
+        await updateRule({
+          id: ruleId,
+          actions: [
+            { op: 'set', field: 'notes', value: 'Monthly rent' },
+            { op: 'link-schedule', value: id },
+          ],
+        });
+        await updateSchedule({ schedule: { id, completed: true } });
+
+        const result = await runRules({ ...transaction, schedule: id });
+
+        expect(result.schedule).toBe(id);
+        expect(result.notes).toBe('Monthly rent');
+      });
+    });
+
+    it('setNextDate sets `next_date`', async () => {
+      const id = await createSchedule({
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 15 },
+                { type: 'day', value: 30 },
+              ],
+            },
+          },
+        ],
+      });
+
+      const { data: ruleId } = await aqlQuery(
+        q('schedules').filter({ id }).calculate('rule'),
+      );
+
+      // Manually update the rule
+      await updateRule({
+        id: ruleId,
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-20',
+              frequency: 'monthly',
+              patterns: [
+                { type: 'day', value: 18 },
+                { type: 'day', value: 28 },
+              ],
+            },
+          },
+        ],
+      });
+
+      let res = await aqlQuery(
+        q('schedules').filter({ id }).select(['next_date']),
+      );
+      let row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-30');
+
+      await setNextDate({ id });
+
+      res = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+      row = res.data[0];
+
+      expect(row.next_date).toBe('2021-05-18');
+    });
+
+    it('skipNextDate skips `next_date`', async () => {
+      /* Dec 2020 calendar for reference:
+        | Su | Mo | Tu | We | Th | Fr | Sa |
+        |    |    | 01 | 02 | 03 | 04 | 05 |
+        | 06 | 07 | 08 | 09 | 10 | 11 | 12 |
+        | 13 | 14 | 15 | 16 | 17 | 18 | 19 |
+        | 20 | 21 | 22 | 23 | 24 | 25 | 26 |
+        | 27 | 28 | 29 | 30 | 31 |
+        */
+      const id = await createSchedule({
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-05',
+              frequency: 'weekly',
+              patterns: [],
+            },
+          },
+        ],
+      });
+
+      let res = await aqlQuery(
+        q('schedules').filter({ id }).select(['next_date']),
+      );
+      let row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-05');
+
+      await skipNextDate({ id });
+
+      res = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+      row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-12');
+    });
+
+    it('skipNextDate skips `next_date` moving `after` weekend', async () => {
+      /* Dec 2020 calendar for reference:
+        | Su | Mo | Tu | We | Th | Fr | Sa |
+        |    |    | 01 | 02 | 03 | 04 | 05 |
+        | 06 | 07 | 08 | 09 | 10 | 11 | 12 |
+        | 13 | 14 | 15 | 16 | 17 | 18 | 19 |
+        | 20 | 21 | 22 | 23 | 24 | 25 | 26 |
+        | 27 | 28 | 29 | 30 | 31 |
+        */
+      const id = await createSchedule({
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-05',
+              frequency: 'weekly',
+              patterns: [],
+              skipWeekend: true,
+              weekendSolveMode: 'after',
+            },
+          },
+        ],
+      });
+
+      let res = await aqlQuery(
+        q('schedules').filter({ id }).select(['next_date']),
+      );
+      let row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-07');
+
+      await skipNextDate({ id });
+
+      res = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+      row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-14');
+    });
+
+    it('skipNextDate skips `next_date` moving `before` weekend', async () => {
+      /* Dec 2020 calendar for reference:
+        | Su | Mo | Tu | We | Th | Fr | Sa |
+        |    |    | 01 | 02 | 03 | 04 | 05 |
+        | 06 | 07 | 08 | 09 | 10 | 11 | 12 |
+        | 13 | 14 | 15 | 16 | 17 | 18 | 19 |
+        | 20 | 21 | 22 | 23 | 24 | 25 | 26 |
+        | 27 | 28 | 29 | 30 | 31 |
+        */
+      const id = await createSchedule({
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-05',
+              frequency: 'weekly',
+              patterns: [],
+              skipWeekend: true,
+              weekendSolveMode: 'before',
+            },
+          },
+        ],
+      });
+
+      let res = await aqlQuery(
+        q('schedules').filter({ id }).select(['next_date']),
+      );
+      let row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-04');
+
+      await skipNextDate({ id });
+
+      res = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+      row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-11');
+    });
+
+    it('skipNextDate keeps the next occurrence when moving `before` weekend', async () => {
+      /* Dec 2020 calendar for reference:
+        | Su | Mo | Tu | We | Th | Fr | Sa |
+        |    |    | 01 | 02 | 03 | 04 | 05 |
+        | 06 | 07 | 08 | 09 | 10 | 11 | 12 |
+        | 13 | 14 | 15 | 16 | 17 | 18 | 19 |
+        | 20 | 21 | 22 | 23 | 24 | 25 | 26 |
+        | 27 | 28 | 29 | 30 | 31 |
+        */
+      const id = await createSchedule({
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2020-12-04',
+              frequency: 'daily',
+              patterns: [],
+              skipWeekend: true,
+              weekendSolveMode: 'before',
+            },
+          },
+        ],
+      });
+
+      let res = await aqlQuery(
+        q('schedules').filter({ id }).select(['next_date']),
+      );
+      let row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-04');
+
+      await skipNextDate({ id });
+
+      res = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+      row = res.data[0];
+
+      expect(row.next_date).toBe('2020-12-07');
+    });
+
+    it('createSchedule keeps an occurrence moved `after` the weekend onto a later day', async () => {
+      // Tests run on Sunday 1 January 2017. Saturday 31 December moves to
+      // Monday 2 January, which is still ahead, so it is the next date.
+      for (const frequency of ['weekly', 'monthly'] as const) {
+        const id = await createSchedule({
+          schedule: { name: frequency },
+          conditions: [
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2016-12-31',
+                frequency,
+                patterns: [],
+                skipWeekend: true,
+                weekendSolveMode: 'after',
+              },
+            },
+          ],
+        });
+
+        const {
+          data: [row],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(row.next_date).toBe('2017-01-02');
+      }
+    });
+
+    it('updateSchedule keeps an occurrence moved `after` the weekend onto a later day', async () => {
+      const id = await createSchedule({
+        conditions: [{ op: 'is', field: 'date', value: '2020-12-20' }],
+      });
+
+      // Edited on Sunday 23 May: Saturday 22 May moves to Monday 24 May,
+      // which is still ahead, so it is the next date.
+      MockDate.set(new Date(2021, 4, 23, 12));
+
+      try {
+        await updateSchedule({
+          schedule: { id },
+          conditions: [
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2021-05-22',
+                frequency: 'weekly',
+                patterns: [],
+                skipWeekend: true,
+                weekendSolveMode: 'after',
+              },
+            },
+          ],
+        });
+
+        const {
+          data: [row],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(row.next_date).toBe('2021-05-24');
+      } finally {
+        MockDate.reset();
+      }
+    });
+
+    it('createSchedule uses the local day west of UTC', async () => {
+      // `new Date('2017-01-01')` is UTC midnight, which is still Saturday
+      // 31 December in New York, so that past Saturday became the next date.
+      const tz = process.env.TZ;
+      process.env.TZ = 'America/New_York';
+
+      try {
+        const id = await createSchedule({
+          conditions: [
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2016-12-24',
+                frequency: 'weekly',
+                patterns: [],
+              },
+            },
+          ],
+        });
+
+        const {
+          data: [row],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(row.next_date).toBe('2017-01-07');
+      } finally {
+        process.env.TZ = tz;
+      }
+    });
+
+    it('createSchedule keeps the last date of a schedule that has ended', async () => {
+      const id = await createSchedule({
+        conditions: [
+          {
+            op: 'is',
+            field: 'date',
+            value: {
+              start: '2016-11-07',
+              frequency: 'weekly',
+              patterns: [],
+              endMode: 'after_n_occurrences',
+              endOccurrences: 2,
+            },
+          },
+        ],
+      });
+
+      const {
+        data: [row],
+      } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+      expect(row.next_date).toBe('2016-11-14');
+    });
+
+    it('auto-posts every missed recurring occurrence while catching up', async () => {
+      MockDate.set(new Date(2016, 11, 31, 12));
+      schedulesApp.startServices();
+
+      try {
+        const accountId = await db.insertAccount({
+          name: 'Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+
+        const id = await createSchedule({
+          schedule: { posts_transaction: true },
+          conditions: [
+            {
+              op: 'is',
+              field: 'account',
+              value: accountId,
+            },
+            {
+              op: 'is',
+              field: 'amount',
+              value: -10000,
+            },
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2016-12-05',
+                frequency: 'weekly',
+                interval: 2,
+                patterns: [],
+              },
+            },
+          ],
+        });
+        const nextDateRow = await db.first<{
+          id: string;
+        }>('SELECT id FROM schedules_next_date WHERE schedule_id = ?', [id]);
+
+        await db.update('schedules_next_date', {
+          id: nextDateRow.id,
+          local_next_date: 20161205,
+          local_next_date_ts: Date.now(),
+          base_next_date: 20161205,
+          base_next_date_ts: Date.now(),
+        });
+
+        await advanceSchedulesService(true);
+
+        const { data: transactions } = await aqlQuery(
+          q('transactions')
+            .filter({ schedule: id })
+            .select(['date', 'amount'])
+            .orderBy({ date: 'asc' }),
+        );
+
+        expect(
+          transactions.map(({ date, amount }) => ({ date, amount })),
+        ).toEqual([
+          { date: '2016-12-05', amount: -10000 },
+          { date: '2016-12-19', amount: -10000 },
+        ]);
+
+        const {
+          data: [schedule],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(schedule.next_date).toBe('2017-01-02');
+      } finally {
+        MockDate.reset();
+        await schedulesApp.stopServices();
+      }
+    });
+
+    it('continues auto-post catch-up after an already paid occurrence', async () => {
+      MockDate.set(new Date(2016, 11, 31, 12));
+      schedulesApp.startServices();
+
+      try {
+        const accountId = await db.insertAccount({
+          name: 'Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+
+        const id = await createSchedule({
+          schedule: { posts_transaction: true },
+          conditions: [
+            {
+              op: 'is',
+              field: 'account',
+              value: accountId,
+            },
+            {
+              op: 'is',
+              field: 'amount',
+              value: -10000,
+            },
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2016-12-05',
+                frequency: 'weekly',
+                interval: 2,
+                patterns: [],
+              },
+            },
+          ],
+        });
+        const nextDateRow = await db.first<{
+          id: string;
+        }>('SELECT id FROM schedules_next_date WHERE schedule_id = ?', [id]);
+
+        await db.update('schedules_next_date', {
+          id: nextDateRow.id,
+          local_next_date: 20161205,
+          local_next_date_ts: Date.now(),
+          base_next_date: 20161205,
+          base_next_date_ts: Date.now(),
+        });
+        await db.insertTransaction({
+          account: accountId,
+          amount: -10000,
+          date: '2016-12-05',
+          schedule: id,
+        });
+
+        await advanceSchedulesService(true);
+
+        const { data: transactions } = await aqlQuery(
+          q('transactions')
+            .filter({ schedule: id })
+            .select(['date', 'amount'])
+            .orderBy({ date: 'asc' }),
+        );
+
+        expect(
+          transactions.map(({ date, amount }) => ({ date, amount })),
+        ).toEqual([
+          { date: '2016-12-05', amount: -10000 },
+          { date: '2016-12-19', amount: -10000 },
+        ]);
+
+        const {
+          data: [schedule],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(schedule.next_date).toBe('2017-01-02');
+      } finally {
+        MockDate.reset();
+        await schedulesApp.stopServices();
+      }
+    });
+
+    it('catches up an auto-post schedule moved `before` a weekend occurrence', async () => {
+      /* Dec 2016 / Jan 2017 calendar for reference:
+        | Su | Mo | Tu | We | Th | Fr | Sa |
+        | 18 | 19 | 20 | 21 | 22 | 23 | 24 |
+        | 25 | 26 | 27 | 28 | 29 | 30 | 31 |
+        | 01 | 02 | 03 | 04 | 05 | 06 | 07 |
+        */
+      MockDate.set(new Date(2016, 11, 31, 12));
+      schedulesApp.startServices();
+
+      try {
+        const accountId = await db.insertAccount({
+          name: 'Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+
+        const id = await createSchedule({
+          schedule: { posts_transaction: true },
+          conditions: [
+            {
+              op: 'is',
+              field: 'account',
+              value: accountId,
+            },
+            {
+              op: 'is',
+              field: 'amount',
+              value: -10000,
+            },
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2016-12-24',
+                frequency: 'weekly',
+                interval: 1,
+                patterns: [],
+                skipWeekend: true,
+                weekendSolveMode: 'before',
+              },
+            },
+          ],
+        });
+        const nextDateRow = await db.first<{
+          id: string;
+        }>('SELECT id FROM schedules_next_date WHERE schedule_id = ?', [id]);
+
+        await db.update('schedules_next_date', {
+          id: nextDateRow.id,
+          local_next_date: 20161223,
+          local_next_date_ts: Date.now(),
+          base_next_date: 20161223,
+          base_next_date_ts: Date.now(),
+        });
+        await db.insertTransaction({
+          account: accountId,
+          amount: -10000,
+          date: '2016-12-23',
+          schedule: id,
+        });
+
+        await advanceSchedulesService(true);
+
+        const { data: transactions } = await aqlQuery(
+          q('transactions')
+            .filter({ schedule: id })
+            .select(['date', 'amount'])
+            .orderBy({ date: 'asc' }),
+        );
+
+        expect(
+          transactions.map(({ date, amount }) => ({ date, amount })),
+        ).toEqual([
+          { date: '2016-12-23', amount: -10000 },
+          { date: '2016-12-30', amount: -10000 },
+        ]);
+
+        const {
+          data: [schedule],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(schedule.next_date).toBe('2017-01-06');
+      } finally {
+        MockDate.reset();
+        await schedulesApp.stopServices();
+      }
+    });
+
+    it('completes one-time auto-post schedules that are already paid', async () => {
+      MockDate.set(new Date(2016, 11, 31, 12));
+      schedulesApp.startServices();
+
+      try {
+        const accountId = await db.insertAccount({
+          name: 'Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+
+        const id = await createSchedule({
+          schedule: { posts_transaction: true },
+          conditions: [
+            {
+              op: 'is',
+              field: 'account',
+              value: accountId,
+            },
+            {
+              op: 'is',
+              field: 'amount',
+              value: -10000,
+            },
+            {
+              op: 'is',
+              field: 'date',
+              value: '2016-12-05',
+            },
+          ],
+        });
+        await db.insertTransaction({
+          account: accountId,
+          amount: -10000,
+          date: '2016-12-05',
+          schedule: id,
+        });
+
+        await advanceSchedulesService(true);
+
+        const {
+          data: [schedule],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['completed']));
+
+        expect(schedule.completed).toBe(true);
+
+        const { data: transactions } = await aqlQuery(
+          q('transactions').filter({ schedule: id }).select(['date']),
+        );
+
+        expect(transactions).toHaveLength(1);
+      } finally {
+        MockDate.reset();
+        await schedulesApp.stopServices();
+      }
+    });
+
+    it('auto-posts one-time schedules that are due', async () => {
+      MockDate.set(new Date(2016, 11, 31, 12));
+      schedulesApp.startServices();
+
+      try {
+        const accountId = await db.insertAccount({
+          name: 'Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+
+        const id = await createSchedule({
+          schedule: { posts_transaction: true },
+          conditions: [
+            {
+              op: 'is',
+              field: 'account',
+              value: accountId,
+            },
+            {
+              op: 'is',
+              field: 'amount',
+              value: -10000,
+            },
+            {
+              op: 'is',
+              field: 'date',
+              value: '2016-12-31',
+            },
+          ],
+        });
+
+        await advanceSchedulesService(true);
+
+        const { data: transactions } = await aqlQuery(
+          q('transactions').filter({ schedule: id }).select(['date', 'amount']),
+        );
+
+        expect(
+          transactions.map(({ date, amount }) => ({ date, amount })),
+        ).toEqual([{ date: '2016-12-31', amount: -10000 }]);
+      } finally {
+        MockDate.reset();
+        await schedulesApp.stopServices();
+      }
+    });
+
+    it('keeps a schedule posted today paid for the rest of the day', async () => {
+      // In tests `currentDay()` is fixed at 2017-01-01, so that is "today".
+      MockDate.set(new Date(2016, 11, 31, 12));
+      schedulesApp.startServices();
+
+      try {
+        const accountId = await db.insertAccount({
+          name: 'Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+
+        const id = await createSchedule({
+          schedule: { posts_transaction: true },
+          conditions: [
+            {
+              op: 'is',
+              field: 'account',
+              value: accountId,
+            },
+            {
+              op: 'is',
+              field: 'amount',
+              value: -10000,
+            },
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2016-12-18',
+                frequency: 'weekly',
+                interval: 1,
+                patterns: [],
+              },
+            },
+          ],
+        });
+        const nextDateRow = await db.first<{
+          id: string;
+        }>('SELECT id FROM schedules_next_date WHERE schedule_id = ?', [id]);
+
+        await db.update('schedules_next_date', {
+          id: nextDateRow.id,
+          local_next_date: 20170101,
+          local_next_date_ts: Date.now(),
+          base_next_date: 20170101,
+          base_next_date_ts: Date.now(),
+        });
+
+        await advanceSchedulesService(true);
+
+        const { data: transactions } = await aqlQuery(
+          q('transactions')
+            .filter({ schedule: id })
+            .select(['date', 'amount'])
+            .orderBy({ date: 'asc' }),
+        );
+
+        expect(
+          transactions.map(({ date, amount }) => ({ date, amount })),
+        ).toEqual([{ date: '2017-01-01', amount: -10000 }]);
+
+        const {
+          data: [schedule],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(schedule.next_date).toBe('2017-01-01');
+
+        // A same-day re-run (e.g. offline retry) neither posts again nor
+        // advances; the schedule stays paid on today's date. Advancement on
+        // a later day is covered by the catch-up tests above.
+        await advanceSchedulesService(true);
+
+        const { data: transactionsAfter } = await aqlQuery(
+          q('transactions')
+            .filter({ schedule: id })
+            .select(['date', 'amount'])
+            .orderBy({ date: 'asc' }),
+        );
+
+        expect(transactionsAfter).toHaveLength(1);
+
+        const {
+          data: [scheduleAfter],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(scheduleAfter.next_date).toBe('2017-01-01');
+      } finally {
+        MockDate.reset();
+        await schedulesApp.stopServices();
+      }
+    });
+
+    it('keeps a `set amount` action in sync when the amount is edited', async () => {
+      MockDate.set(new Date(2016, 11, 31, 12));
+      schedulesApp.startServices();
+
+      try {
+        const accountId = await db.insertAccount({
+          name: 'Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+
+        const id = await createSchedule({
+          schedule: { posts_transaction: true },
+          conditions: [
+            { op: 'is', field: 'account', value: accountId },
+            { op: 'is', field: 'amount', value: -6000 },
+            { op: 'is', field: 'date', value: '2016-12-31' },
+          ],
+        });
+
+        // Some schedules have a rule that also *sets* the amount (e.g. a rule
+        // customized via "Edit as rule"). Posting runs the rule, so the action
+        // value must track the amount condition.
+        const { data: ruleId } = await aqlQuery(
+          q('schedules').filter({ id }).calculate('rule'),
+        );
+        const ruleRow = await db.first<Pick<db.DbRule, 'actions'>>(
+          'SELECT actions FROM rules WHERE id = ?',
+          [ruleId],
+        );
+        await updateRule({
+          id: ruleId,
+          actions: [
+            { op: 'set', field: 'amount', value: -6000 },
+            ...JSON.parse(ruleRow.actions),
+          ],
+        });
+
+        // Edit the amount in the schedule editor (condition only).
+        await updateSchedule({
+          schedule: { id },
+          conditions: [
+            { op: 'is', field: 'account', value: accountId },
+            { op: 'is', field: 'date', value: '2016-12-31' },
+            { op: 'is', field: 'amount', value: -8000 },
+          ],
+        });
+
+        await advanceSchedulesService(true);
+
+        const { data: transactions } = await aqlQuery(
+          q('transactions').filter({ schedule: id }).select(['amount']),
+        );
+
+        expect(transactions.map(({ amount }) => amount)).toEqual([-8000]);
+      } finally {
+        MockDate.reset();
+        await schedulesApp.stopServices();
+      }
+    });
+
+    it('advances a recurring schedule without an account when paid', async () => {
+      MockDate.set(new Date(2016, 11, 6, 12));
+      schedulesApp.startServices();
+
+      try {
+        const accountId = await db.insertAccount({
+          name: 'Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+
+        const id = await createSchedule({
+          schedule: { posts_transaction: false },
+          conditions: [
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2016-12-05',
+                frequency: 'weekly',
+                interval: 2,
+                patterns: [],
+              },
+            },
+          ],
+        });
+
+        const nextDateRow = await db.first<{
+          id: string;
+        }>('SELECT id FROM schedules_next_date WHERE schedule_id = ?', [id]);
+
+        await db.update('schedules_next_date', {
+          id: nextDateRow.id,
+          local_next_date: 20161205,
+          local_next_date_ts: Date.now(),
+          base_next_date: 20161205,
+          base_next_date_ts: Date.now(),
+        });
+
+        await db.insertTransaction({
+          account: accountId,
+          amount: -10000,
+          date: '2016-12-05',
+          schedule: id,
+        });
+
+        await advanceSchedulesService(true);
+
+        const {
+          data: [schedule],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(schedule.next_date).toBe('2016-12-19');
+      } finally {
+        MockDate.reset();
+        await schedulesApp.stopServices();
+      }
+    });
+
+    it('does not advance a recurring schedule for a closed account when paid', async () => {
+      MockDate.set(new Date(2016, 11, 6, 12));
+      schedulesApp.startServices();
+
+      try {
+        const openAccountId = await db.insertAccount({
+          name: 'Open Checking',
+          offbudget: 0,
+          closed: 0,
+        });
+
+        const closedAccountId = await db.insertAccount({
+          name: 'Closed Checking',
+          offbudget: 0,
+          closed: 1,
+        });
+
+        const id = await createSchedule({
+          schedule: { posts_transaction: false },
+          conditions: [
+            {
+              op: 'is',
+              field: 'account',
+              value: closedAccountId,
+            },
+            {
+              op: 'is',
+              field: 'date',
+              value: {
+                start: '2016-12-05',
+                frequency: 'weekly',
+                interval: 2,
+                patterns: [],
+              },
+            },
+          ],
+        });
+
+        const nextDateRow = await db.first<{
+          id: string;
+        }>('SELECT id FROM schedules_next_date WHERE schedule_id = ?', [id]);
+
+        await db.update('schedules_next_date', {
+          id: nextDateRow.id,
+          local_next_date: 20161205,
+          local_next_date_ts: Date.now(),
+          base_next_date: 20161205,
+          base_next_date_ts: Date.now(),
+        });
+
+        await db.insertTransaction({
+          account: openAccountId,
+          amount: -10000,
+          date: '2016-12-05',
+          schedule: id,
+        });
+
+        await advanceSchedulesService(true);
+
+        const {
+          data: [schedule],
+        } = await aqlQuery(q('schedules').filter({ id }).select(['next_date']));
+
+        expect(schedule.next_date).toBe('2016-12-05');
+      } finally {
+        MockDate.reset();
+        await schedulesApp.stopServices();
+      }
+    });
+  });
+
+  describe('schedule advancement failures', () => {
+    let accountId: string;
+    let syncErrors: number;
+    const catchUpDates = ['2016-12-18', '2016-12-25', '2017-01-01'];
+    const healthyDates = ['2016-12-25', '2017-01-01'];
+
+    function forwardSync(event: ServerEvents['sync-event']) {
+      if (event.type === 'error') {
+        syncErrors++;
+      }
+      schedulesApp.events.emit('sync', event);
+    }
+
+    beforeEach(async () => {
+      MockDate.set(new Date(2016, 11, 31, 12));
+      schedulesApp.startServices();
+      await prefs.loadPrefs();
+      accountId = await db.insertAccount({ name: 'Checking', closed: 0 });
+      syncErrors = 0;
+      // Production also registers the schedule listener on the main app.
+      mainApp.events.on('sync', forwardSync);
+    });
+
+    afterEach(async () => {
+      // Detach before draining so a self-retry regression cannot leak work.
+      mainApp.events.off('sync', forwardSync);
+      await runMutator(() => Promise.resolve());
+      db.runQuery('DROP TRIGGER IF EXISTS fail_schedule_advancement');
+      prefs.unloadPrefs();
+      MockDate.reset();
+      await schedulesApp.stopServices();
+    });
+
+    function rewindSchedule(id: string, nextDate = 20161218) {
+      db.runQuery(
+        'UPDATE schedules_next_date SET local_next_date = ?, base_next_date = ? WHERE schedule_id = ?',
+        [nextDate, nextDate, id],
+      );
+    }
+
+    async function createRecurringSchedule({
+      postsTransaction = true,
+      nextDate = 20161218,
+    } = {}) {
+      const id = await createSchedule({
+        schedule: { posts_transaction: postsTransaction },
+        conditions: [
+          { op: 'is', field: 'account', value: accountId },
+          {
+            op: 'is',
+            field: 'date',
+            value: { start: '2016-12-18', frequency: 'weekly', patterns: [] },
+          },
+        ],
+      });
+      rewindSchedule(id, nextDate);
+      if (!postsTransaction) {
+        await db.insertTransaction({
+          account: accountId,
+          amount: 0,
+          date: '2016-12-18',
+          schedule: id,
+        });
+      }
+      return id;
+    }
+
+    async function postedDates(id: string) {
+      const { data } = await aqlQuery(
+        q('transactions')
+          .filter({ schedule: id })
+          .select('date')
+          .orderBy({ date: 'asc' }),
+      );
+      return data.map(row => row.date);
+    }
+
+    async function syncSuccessfully() {
+      mainApp.events.emit('sync', { type: 'success', tables: [] });
+      await runMutator(() => Promise.resolve());
+      // Also drain a retry incorrectly enqueued by this run's own error.
+      await runMutator(() => Promise.resolve());
+    }
+
+    it.each([
+      { postsTransaction: true, ruleState: 'missing' },
+      { postsTransaction: false, ruleState: 'corrupt' },
+    ])(
+      'isolates a $ruleState rule and retries unexpected errors without duplicates (auto-post: $postsTransaction)',
+      async ({ postsTransaction, ruleState }) => {
+        const failedId = await createRecurringSchedule({ postsTransaction });
+        const brokenId = await createRecurringSchedule({
+          postsTransaction: false,
+        });
+        // The healthy schedule must sort after the failing ones.
+        const healthyId = await createRecurringSchedule({ nextDate: 20161225 });
+        const { data: ruleId } = await aqlQuery(
+          q('schedules').filter({ id: brokenId }).calculate('rule'),
+        );
+        if (ruleState === 'missing') {
+          db.runQuery('DELETE FROM rules WHERE id = ?', [ruleId]);
+        } else {
+          db.runQuery('UPDATE rules SET actions = ? WHERE id = ?', [
+            JSON.stringify([{ op: 'invalid-action' }]),
+            ruleId,
+          ]);
+        }
+        await loadRules();
+        // Exercise the real setNextDate write through each advancement path.
+        db.runQuery(`
+          CREATE TEMP TRIGGER fail_schedule_advancement
+          BEFORE UPDATE OF local_next_date ON schedules_next_date
+          WHEN OLD.schedule_id = '${failedId}'
+          BEGIN SELECT RAISE(FAIL, 'schedule advancement write failed'); END
+        `);
+
+        await syncSuccessfully();
+        expect.soft(syncErrors).toBe(1);
+        expect.soft(prefs.getPrefs().lastScheduleRun).not.toBe('2017-01-01');
+        expect(await postedDates(failedId)).toEqual(['2016-12-18']);
+        expect(await postedDates(healthyId)).toEqual(healthyDates);
+
+        db.runQuery('DROP TRIGGER fail_schedule_advancement');
+        await syncSuccessfully();
+        expect(await postedDates(failedId)).toEqual(
+          postsTransaction ? catchUpDates : ['2016-12-18'],
+        );
+        expect(await postedDates(healthyId)).toEqual(healthyDates);
+        const { data: nextDate } = await aqlQuery(
+          q('schedules').filter({ id: failedId }).calculate('next_date'),
+        );
+        expect(nextDate).toBe('2017-01-01');
+        expect(prefs.getPrefs().lastScheduleRun).toBe('2017-01-01');
+
+        // Incoming old next-date data must not bypass the successful daily marker.
+        rewindSchedule(healthyId);
+        await syncSuccessfully();
+        const { data: unchangedDate } = await aqlQuery(
+          q('schedules').filter({ id: healthyId }).calculate('next_date'),
+        );
+        expect(unchangedDate).toBe('2016-12-18');
+      },
+    );
+
+    it('does not retry its own clock-drift error', async () => {
+      const id = await createSchedule({
+        schedule: { posts_transaction: true },
+        conditions: [
+          { op: 'is', field: 'account', value: accountId },
+          { op: 'is', field: 'date', value: '2016-12-18' },
+        ],
+      });
+      // Completing this paid one-time schedule writes a new message.
+      await db.insertTransaction({
+        account: accountId,
+        amount: 0,
+        date: '2016-12-18',
+        schedule: id,
+      });
+      // A backward clock correction leaves the clock over five minutes ahead.
+      MockDate.set(new Date(2016, 11, 31, 11, 50));
+
+      await syncSuccessfully();
+      expect(syncErrors).toBe(1);
+    });
+  });
+
+  describe('auto-post service throttling', () => {
+    const dateCondition = {
+      op: 'is',
+      field: 'date',
+      value: '2020-12-01',
+    } as const;
+
+    beforeEach(async () => {
+      await prefs.loadPrefs();
+      await prefs.savePrefs({ lastScheduleRun: '2020-12-01' });
+    });
+
+    afterEach(() => {
+      prefs.unloadPrefs();
+    });
+
+    it('clears the marker when a schedule that posts transactions is created', async () => {
+      await createSchedule({
+        schedule: { posts_transaction: true },
+        conditions: [dateCondition],
+      });
+
+      expect(prefs.getPrefs().lastScheduleRun).toBeUndefined();
+    });
+
+    it('keeps the marker when the created schedule does not post transactions', async () => {
+      await createSchedule({
+        schedule: { posts_transaction: false },
+        conditions: [dateCondition],
+      });
+
+      expect(prefs.getPrefs().lastScheduleRun).toBe('2020-12-01');
+    });
+
+    it('clears the marker when a schedule starts posting transactions', async () => {
+      const id = await createSchedule({ conditions: [dateCondition] });
+
+      await updateSchedule({ schedule: { id, posts_transaction: true } });
+
+      expect(prefs.getPrefs().lastScheduleRun).toBeUndefined();
+    });
+
+    it('clears the marker when updating a schedule that already posts transactions', async () => {
+      const id = await createSchedule({
+        schedule: { posts_transaction: true },
+        conditions: [dateCondition],
+      });
+
+      await prefs.savePrefs({ lastScheduleRun: '2020-12-01' });
+
+      await updateSchedule({ schedule: { id, name: 'Renamed schedule' } });
+
+      expect(prefs.getPrefs().lastScheduleRun).toBeUndefined();
+    });
+
+    it('keeps the marker when updating a schedule that does not post transactions', async () => {
+      const id = await createSchedule({ conditions: [dateCondition] });
+
+      await updateSchedule({ schedule: { id, name: 'Renamed schedule' } });
+
+      expect(prefs.getPrefs().lastScheduleRun).toBe('2020-12-01');
+    });
+  });
+});
