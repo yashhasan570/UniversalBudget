@@ -92,7 +92,7 @@ test.describe('Onboarding', () => {
 
   test('creates a new budget file by importing Actual budget', async () => {
     const budgetPage = await configurationPage.importBudget(
-      'Universal Budget',
+      'Actual',
       path.resolve(__dirname, 'data/actual-demo-budget.zip'),
     );
 

@@ -2,7 +2,7 @@
   "name": "desktop-electron",
   "version": "26.11.0",
   "description": "A simple and powerful personal finance system",
-  "author": "yashhasan570",
+  "author": "Actual",
   "main": "build/desktop-electron/index.js",
   "scripts": {
     "clean": "rm -rf dist",

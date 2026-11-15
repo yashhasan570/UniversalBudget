@@ -377,8 +377,8 @@ export default defineConfig(async ({ mode, command }) => {
             // srcDir: 'service-worker',
             // filename: 'plugin-sw.js',
             // manifest: {
-            //   name: 'Universal Budget',
-            //   short_name: 'Universal Budget',
+            //   name: 'Actual',
+            //   short_name: 'Actual',
             //   description: 'A local-first personal finance tool',
             //   theme_color: '#5c3dbb',
             //   background_color: '#5c3dbb',

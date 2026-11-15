@@ -66,7 +66,7 @@ const LINK_PAGE_HTML = `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Universal Budget</title>
+    <title>Actual</title>
   </head>
   <body>
     <script>

@@ -236,7 +236,7 @@ export function CommandBar() {
       items: [
         {
           id: 'start-tour',
-          name: t('Take a tour of {{appName}}', { appName: 'Universal Budget' }),
+          name: t('Take a tour of {{appName}}', { appName: 'Actual' }),
           Icon: SvgHelp,
         },
       ],

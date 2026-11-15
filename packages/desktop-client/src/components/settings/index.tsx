@@ -66,7 +66,7 @@ function About() {
       title={t('About')}
       description={
         <Trans>
-          <span>Universal Budget</span> is a super fast privacy-focused app for managing
+          <span>Actual</span> is a super fast privacy-focused app for managing
           your finances.
         </Trans>
       }

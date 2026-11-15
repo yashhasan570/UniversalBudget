@@ -1,23 +1,83 @@
-# Universal Budget
+<p align="center">
+  <img src="/demo.png" alt="Actualbudget" />
+</p>
 
-Local-first personal finance and budgeting: track accounts and transactions, budget with envelopes or goal-based tracking, and keep everything in sync across devices.
+## Getting Started
 
-## Features
+Actual is a local-first personal finance tool. It is 100% free and open-source, written in NodeJS, it has a synchronization element so that all your changes can move between devices without any heavy lifting.
 
-- Local-first budget files with end-to-end encryption
-- Envelope and goal budgeting, reports and graphs
-- Multi-device sync with a self-hosted sync server
-- Bank import (CSV/OFX/QIF), YNAB4 and nYNAB import
-- REST API and plugins for integrations
+If you are interested in contributing, or want to know how development works, see our [contributing](https://universalbudget.org/docs/contributing/) document we would love to have you.
 
-## Install
+Want to say thanks? Click the ⭐ at the top of the page.
 
-- Web app: `yarn build:browser` and serve the output, or
-- Sync server + web client in Docker (see `docker-compose.yml`), or
-- Desktop app: `yarn build:desktop`
+## Key Links
 
-Configuration is environment-based: every `UNIVERSALBUDGET_*` variable can be set for the server.
+- Actual [discord](https://discord.gg/pRYNYr4W5A) community.
+- Actual [Community Documentation](https://universalbudget.org/docs)
+- [Frequently asked questions](https://universalbudget.org/docs/faq)
 
-## Contact
+## Installation
 
-Telegram: [@johnconstantine570](https://t.me/johnconstantine570)
+There are four ways to deploy Actual:
+
+1. One-click deployment [via PikaPods](https://www.pikapods.com/pods?run=actual) (~2.00 $/month) - recommended for non-technical users
+1. Managed hosting [via Fly.io](https://universalbudget.org/docs/install/fly) (~1.50 $/month)
+1. Self-hosted by using [a Docker image](https://universalbudget.org/docs/install/docker)
+1. Local-only apps - [downloadable Windows, Mac and Linux apps](https://universalbudget.org/download/) you can run on your device
+
+Learn more in the [installation instructions docs](https://universalbudget.org/docs/install/).
+
+## Ready to Start Budgeting?
+
+Read about [Envelope budgeting](https://universalbudget.org/docs/getting-started/envelope-budgeting) to know more about the idea behind Universal Budget.
+
+### Are you new to budgeting or want to start fresh?
+
+Check out the community's [Starting Fresh](https://universalbudget.org/docs/getting-started/starting-fresh) guide so you can quickly get up and running!
+
+### Are you migrating from other budgeting apps?
+
+Check out the community's [Migration](https://universalbudget.org/docs/migration/) guide to start jumping on the Universal Budget train!
+
+## Documentation
+
+We have a wide range of documentation on how to use Actual, this is all available in our [Community Documentation](https://universalbudget.org/docs), this includes topics on Budgeting, Account Management, Tips & Tricks and some documentation for developers.
+
+## Contributing
+
+Actual is a community driven product. Learn more about [contributing to Actual](https://universalbudget.org/docs/contributing/).
+
+### Code structure
+
+The Actual app is split up into a few packages:
+
+- loot-core - The core application that runs on any platform
+- desktop-client - The desktop UI
+- desktop-electron - The desktop app
+
+More information on the project structure is available in our [community documentation](https://universalbudget.org/docs/contributing/project-details).
+
+### Feature Requests
+
+Current feature requests can be seen [here](https://github.com/universalbudget/actual/issues?q=is%3Aissue+label%3A%22needs+votes%22+sort%3Areactions-%2B1-desc).
+Vote for your favorite requests by reacting :+1: to the top comment of the request.
+
+To add new feature requests, open a new Issue of the "Feature Request" type.
+
+### Translation
+
+Make Universal Budget accessible to more people by helping with the [Internationalization](https://universalbudget.org/docs/contributing/i18n/) of Actual. We are using a crowd sourcing tool to manage the translations, see our [Weblate Project](https://hosted.weblate.org/projects/universalbudget/). Weblate proudly supports open-source software projects through their [Libre plan](https://weblate.org/en/hosting/#libre).
+
+<a href="https://hosted.weblate.org/engage/universalbudget/">
+<img src="https://hosted.weblate.org/widget/universalbudget/actual/287x66-grey.png" alt="Translation status" />
+</a>
+
+## Sponsors
+
+Thanks to our wonderful sponsors who make Universal Budget possible!
+
+<a href="https://www.netlify.com"><img src="https://www.netlify.com/v3/img/components/netlify-color-accent.svg" alt="Deploys by Netlify" /></a>
+<a href="https://depot.dev"><img src="https://depot.dev/badges/built-with-depot.svg" alt="Built with Depot" /></a>
+<a href="https://www.docker.com"><img src="https://www.docker.com/app/uploads/2023/05/symbol_blue-docker-logo.png" alt="Docker" height="48" /></a>
+<a href="https://github.com"><img src="https://avatars.githubusercontent.com/u/9919?s=200&v=4" alt="GitHub" height="48" /></a>
+<a href="https://www.anthropic.com"><img src="https://avatars.githubusercontent.com/u/76263028?s=200&v=4" alt="Anthropic" height="48" /></a>
