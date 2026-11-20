@@ -42,6 +42,7 @@
     "build:plugins-service": "yarn workspace plugins-service build",
     "build:api": "yarn build --scope=@universal-app/api",
     "build:mobile": "yarn build --scope=mobile-client",
+    "release:android": "yarn build:browser --mobile && yarn workspace mobile-client release:android",
     "build:cli": "yarn build --scope=@universal-app/cli",
     "build:docs": "yarn workspace docs build",
     "build:storybook": "yarn workspace @universal-app/components build:storybook",
