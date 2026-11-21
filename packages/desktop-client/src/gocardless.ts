@@ -1,4 +1,5 @@
 import { send } from '@universal-app/core/platform/client/connection';
+import * as Platform from '@universal-app/core/shared/platform';
 import type {
   AccountEntity,
   GoCardlessToken,
@@ -26,6 +27,7 @@ function _authorize(
             const resp = await send('gocardless-create-web-token', {
               institutionId,
               accessValidForDays: 90,
+              returnToApp: Platform.isNativeMobileApp,
             });
 
             if ('error' in resp) return resp;
